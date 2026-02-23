@@ -79,6 +79,22 @@ export default function App() {
   const sessionId = localStorage.getItem('sessionId');
 
   useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch('/api/health');
+        if (res.ok) {
+          console.log('Server health check passed');
+        } else {
+          console.warn('Server health check failed:', res.status);
+        }
+      } catch (err) {
+        console.error('Server is unreachable:', err);
+        setError('Cannot connect to server. Please ensure the backend is running.');
+      }
+    };
+
+    checkHealth();
+
     if (sessionId) {
       fetchUser();
     } else {
@@ -100,11 +116,13 @@ export default function App() {
         const data = await res.json();
         setUser(data);
       } else {
+        const errorText = await res.text();
+        console.error('Failed to fetch user:', errorText);
         localStorage.removeItem('sessionId');
         setUser(null);
       }
     } catch (err) {
-      console.error('Failed to fetch user:', err);
+      console.error('User fetch network error:', err);
     } finally {
       setLoading(false);
     }
@@ -118,10 +136,15 @@ export default function App() {
         console.log('Fetched files:', data);
         setFiles(data);
       } else {
-        console.error('Failed to fetch files:', await res.text());
+        const errorText = await res.text();
+        console.error('Failed to fetch files:', errorText);
+        setError(`Server error: ${res.status}`);
       }
-    } catch (err) {
-      console.error('Failed to fetch files:', err);
+    } catch (err: any) {
+      console.error('Failed to fetch files (Network Error):', err);
+      setError(`Connection failed: ${err.message || 'Unknown error'}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -170,6 +193,7 @@ export default function App() {
         throw new Error(data.error || 'Failed to get auth URL');
       }
       const { url } = await res.json();
+      console.log('Received Google Auth URL:', url);
       
       const width = 600;
       const height = 700;
@@ -718,7 +742,17 @@ export default function App() {
               className="mb-6 p-4 bg-red-50 border border-red-100 rounded-xl flex items-center gap-3 text-red-700 text-sm"
             >
               <AlertCircle className="w-5 h-5 flex-shrink-0" />
-              {error}
+              <div className="flex-1">{error}</div>
+              <button 
+                onClick={() => {
+                  setError(null);
+                  fetchFiles();
+                  if (sessionId) fetchUser();
+                }}
+                className="px-3 py-1 bg-red-100 hover:bg-red-200 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+              >
+                Retry
+              </button>
             </motion.div>
           )}
           {success && (
@@ -1082,6 +1116,8 @@ export default function App() {
             <div>IsAdmin: {user?.isAdmin ? 'Yes' : 'No'}</div>
             <div>Session: {sessionId ? `${sessionId.substring(0, 8)}...` : 'None'}</div>
             <div>Files: {files.length}</div>
+            <div>Google Auth: {import.meta.env.VITE_GOOGLE_CLIENT_ID ? 'Configured' : 'Missing VITE_GOOGLE_CLIENT_ID'}</div>
+            <div>App URL: {import.meta.env.VITE_APP_URL || 'Not set (using window.origin)'}</div>
           </div>
         </div>
       </div>

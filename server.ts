@@ -22,10 +22,23 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 // Database setup
-const db = new Database('files.db');
+let db: Database.Database;
+try {
+  db = new Database('files.db');
+  console.log('Database connected successfully');
+} catch (err) {
+  console.error('Failed to connect to database:', err);
+  process.exit(1);
+}
 
 // Migration: Handle schema changes
-const tableInfo = (name: string) => db.prepare(`PRAGMA table_info(${name})`).all() as any[];
+const tableInfo = (name: string) => {
+  try {
+    return db.prepare(`PRAGMA table_info(${name})`).all() as any[];
+  } catch (err) {
+    return [];
+  }
+};
 
 // Check sessions table
 const sessionsCols = tableInfo('sessions');
@@ -107,6 +120,17 @@ if (!existingAdmin) {
 const app = express();
 app.use(express.json());
 
+// Request Logger
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+});
+
+// Health Check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
 // Multer setup for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -151,8 +175,16 @@ const isAdmin = (req: express.Request) => {
 
 // API Routes
 
+// API Routes
+const apiRouter = express.Router();
+
+// Health check (no DB dependency)
+apiRouter.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Local Auth
-app.post('/api/register', (req, res) => {
+apiRouter.post('/register', (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
@@ -162,6 +194,7 @@ app.post('/api/register', (req, res) => {
     db.prepare('INSERT INTO users (email, password, role) VALUES (?, ?, ?)').run(email, hashedPassword, role);
     res.json({ success: true });
   } catch (err: any) {
+    console.error('Registration error:', err);
     if (err.message.includes('UNIQUE constraint failed')) {
       return res.status(400).json({ error: 'Email already registered' });
     }
@@ -169,27 +202,32 @@ app.post('/api/register', (req, res) => {
   }
 });
 
-app.post('/api/login', (req, res) => {
+apiRouter.post('/login', (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
-  if (!user || !bcrypt.compareSync(password, user.password)) {
-    return res.status(401).json({ error: 'Invalid email or password' });
+  try {
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+    if (!user || !bcrypt.compareSync(password, user.password)) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const sessionId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const expiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    
+    db.prepare('INSERT INTO sessions (id, user_id, email, role, expiry) VALUES (?, ?, ?, ?, ?)').run(
+      sessionId, user.id, user.email, user.role, expiry
+    );
+
+    res.json({ sessionId, email: user.email, role: user.role });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed' });
   }
-
-  const sessionId = Math.random().toString(36).substring(2) + Date.now().toString(36);
-  const expiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-  
-  db.prepare('INSERT INTO sessions (id, user_id, email, role, expiry) VALUES (?, ?, ?, ?, ?)').run(
-    sessionId, user.id, user.email, user.role, expiry
-  );
-
-  res.json({ sessionId, email: user.email, role: user.role });
 });
 
-// Google OAuth (Optional, keeping it as an alternative)
-app.get('/api/auth/url', (req, res) => {
+// Google OAuth URL
+apiRouter.get('/auth/url', (req, res) => {
   const appUrl = (process.env.APP_URL || '').replace(/\/$/, '');
   if (!appUrl) {
     console.error('APP_URL is not set in environment variables');
@@ -198,10 +236,13 @@ app.get('/api/auth/url', (req, res) => {
 
   const rootUrl = 'https://accounts.google.com/o/oauth2/v2/auth';
   const clientId = process.env.VITE_GOOGLE_CLIENT_ID || '';
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET || '';
   
-  if (!clientId) {
-    console.error('VITE_GOOGLE_CLIENT_ID is missing');
-    return res.status(500).json({ error: 'Google Client ID not configured in Secrets' });
+  if (!clientId || !clientSecret) {
+    console.error(`Google Auth Configuration Missing: ClientID: ${!!clientId}, Secret: ${!!clientSecret}`);
+    return res.status(500).json({ 
+      error: 'Google Auth not fully configured. Please check VITE_GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Secrets.' 
+    });
   }
 
   console.log(`Initiating Google Auth with Client ID starting with: ${clientId.substring(0, 5)}...`);
@@ -223,100 +264,33 @@ app.get('/api/auth/url', (req, res) => {
   res.json({ url: `${rootUrl}?${qs.toString()}` });
 });
 
-app.get('/auth/callback', async (req, res) => {
-  const code = req.query.code as string;
-  if (!code) return res.status(400).send('No code provided');
-
-  const appUrl = (process.env.APP_URL || '').replace(/\/$/, '');
-  
+apiRouter.get('/user', (req, res) => {
   try {
-    console.log('Exchanging Google OAuth code for tokens...');
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        code,
-        client_id: process.env.VITE_GOOGLE_CLIENT_ID || '',
-        client_secret: process.env.GOOGLE_CLIENT_SECRET || '',
-        redirect_uri: `${appUrl}/auth/callback`,
-        grant_type: 'authorization_code',
-      }),
-    });
-
-    const tokens = await tokenResponse.json();
-    if (tokens.error) {
-      console.error('Google Token Exchange Error:', tokens);
-      throw new Error(tokens.error_description || tokens.error);
-    }
-
-    const userResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
-    });
-    const user = await userResponse.json();
-
-    // Check if user exists in local DB, if not create them
-    let localUser = db.prepare('SELECT * FROM users WHERE email = ?').get(user.email) as any;
-    if (!localUser) {
-      const randomPassword = Math.random().toString(36);
-      const hashedPassword = bcrypt.hashSync(randomPassword, 10);
-      const role = user.email.toLowerCase() === ADMIN_EMAIL.toLowerCase() ? 'admin' : 'user';
-      const result = db.prepare('INSERT INTO users (email, password, role) VALUES (?, ?, ?)').run(user.email, hashedPassword, role);
-      localUser = { id: result.lastInsertRowid, email: user.email, role };
-    }
-
-    const sessionId = Math.random().toString(36).substring(2) + Date.now().toString(36);
-    const expiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    
-    db.prepare('INSERT INTO sessions (id, user_id, email, role, expiry) VALUES (?, ?, ?, ?, ?)').run(
-      sessionId, localUser.id, localUser.email, localUser.role, expiry
-    );
-
-    res.send(`
-      <html>
-        <body>
-          <script>
-            if (window.opener) {
-              window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: '${sessionId}', email: '${user.email}', role: '${localUser.role}' }, '*');
-              window.close();
-            } else {
-              window.location.href = '/';
-            }
-          </script>
-          <p>Authentication successful. This window should close automatically.</p>
-        </body>
-      </html>
-    `);
-  } catch (error: any) {
-    console.error('Auth error:', error);
-    res.status(500).send('Authentication failed: ' + error.message);
+    const session = getSession(req);
+    if (!session) return res.status(401).json({ error: 'Not authenticated' });
+    res.json({ email: session.email, isAdmin: session.role === 'admin', role: session.role });
+  } catch (err) {
+    console.error('Get user error:', err);
+    res.status(500).json({ error: 'Failed to get user info' });
   }
 });
 
-// API Routes
-const apiRouter = express.Router();
-
-apiRouter.get('/user', (req, res) => {
-  const session = getSession(req);
-  if (!session) return res.status(401).json({ error: 'Not authenticated' });
-  res.json({ email: session.email, isAdmin: session.role === 'admin', role: session.role });
-});
-
 apiRouter.post('/upload', upload.single('file'), (req, res) => {
-  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin only' });
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-  const { filename, originalname, mimetype, size } = req.file;
-  const category = req.body.category || 'Documents';
-  const expiry_date = req.body.expiry_date || null;
-  
   try {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Admin only' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const { filename, originalname, mimetype, size } = req.file;
+    const category = req.body.category || 'Documents';
+    const expiry_date = req.body.expiry_date || null;
+    
     db.prepare('INSERT INTO files (name, original_name, mime_type, size, category, expiry_date) VALUES (?, ?, ?, ?, ?, ?)').run(
       filename, originalname, mimetype, size, category, expiry_date
     );
     res.json({ success: true });
   } catch (err) {
-    console.error('Database insertion error:', err);
-    res.status(500).json({ error: 'Failed to save file metadata' });
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
@@ -333,51 +307,66 @@ apiRouter.get('/files', (req, res) => {
 });
 
 apiRouter.get('/files/:id/preview', (req, res) => {
-  const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id) as any;
-  if (!file) return res.status(404).send('File not found');
+  try {
+    const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id) as any;
+    if (!file) return res.status(404).send('File not found');
 
-  const filePath = path.join(UPLOADS_DIR, file.name);
-  if (!fs.existsSync(filePath)) return res.status(404).send('File not found on disk');
+    const filePath = path.join(UPLOADS_DIR, file.name);
+    if (!fs.existsSync(filePath)) return res.status(404).send('File not found on disk');
 
-  res.setHeader('Content-Type', file.mime_type);
-  res.setHeader('Content-Disposition', 'inline');
-  res.sendFile(filePath);
+    res.setHeader('Content-Type', file.mime_type);
+    res.setHeader('Content-Disposition', 'inline');
+    res.sendFile(filePath);
+  } catch (err) {
+    console.error('Preview error:', err);
+    res.status(500).send('Preview failed');
+  }
 });
 
 apiRouter.get('/files/:id/download', (req, res) => {
-  const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id) as any;
-  if (!file) return res.status(404).send('File not found');
+  try {
+    const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id) as any;
+    if (!file) return res.status(404).send('File not found');
 
-  const filePath = path.join(UPLOADS_DIR, file.name);
-  if (!fs.existsSync(filePath)) return res.status(404).send('File not found on disk');
+    const filePath = path.join(UPLOADS_DIR, file.name);
+    if (!fs.existsSync(filePath)) return res.status(404).send('File not found on disk');
 
-  res.download(filePath, file.original_name);
+    res.download(filePath, file.original_name);
+  } catch (err) {
+    console.error('Download error:', err);
+    res.status(500).send('Download failed');
+  }
 });
 
 apiRouter.delete('/files/:id', (req, res) => {
-  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin only' });
+  try {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Admin only' });
 
-  const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id) as any;
-  if (!file) return res.status(404).json({ error: 'File not found' });
+    const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id) as any;
+    if (!file) return res.status(404).json({ error: 'File not found' });
 
-  const filePath = path.join(UPLOADS_DIR, file.name);
-  if (fs.existsSync(filePath)) {
-    try { fs.unlinkSync(filePath); } catch (err) {}
+    const filePath = path.join(UPLOADS_DIR, file.name);
+    if (fs.existsSync(filePath)) {
+      try { fs.unlinkSync(filePath); } catch (err) {}
+    }
+
+    db.prepare('DELETE FROM files WHERE id = ?').run(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete error:', err);
+    res.status(500).json({ error: 'Delete failed' });
   }
-
-  db.prepare('DELETE FROM files WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
 });
 
 apiRouter.delete('/files', (req, res) => {
-  if (!isAdmin(req)) return res.status(403).json({ error: 'Admin only' });
-
-  const { ids } = req.body;
-  if (!ids || !Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ error: 'No IDs provided' });
-  }
-
   try {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Admin only' });
+
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'No IDs provided' });
+    }
+
     const placeholders = ids.map(() => '?').join(',');
     const files = db.prepare(`SELECT * FROM files WHERE id IN (${placeholders})`).all(...ids) as any[];
 
@@ -391,6 +380,7 @@ apiRouter.delete('/files', (req, res) => {
     db.prepare(`DELETE FROM files WHERE id IN (${placeholders})`).run(...ids);
     res.json({ success: true, count: ids.length });
   } catch (err) {
+    console.error('Bulk delete error:', err);
     res.status(500).json({ error: 'Bulk deletion failed' });
   }
 });
@@ -400,7 +390,14 @@ app.use('/api', apiRouter);
 
 // Fallback for missing API routes - ALWAYS return JSON
 app.all('/api/*', (req, res) => {
+  console.log(`404 - API route not found: ${req.method} ${req.url}`);
   res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
+});
+
+// Global Error Handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Unhandled Server Error:', err);
+  res.status(500).json({ error: 'Internal server error', details: err.message });
 });
 
 async function startServer() {
@@ -423,4 +420,7 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
