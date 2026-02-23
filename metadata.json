@@ -1,0 +1,5 @@
+{
+  "name": "SecureShare - Admin File Portal",
+  "description": "A secure file sharing platform where an admin can upload files for users to view and download.",
+  "requestFramePermissions": []
+}
